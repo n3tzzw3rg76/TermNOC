@@ -1,0 +1,36 @@
+types:
+  virtualmin:
+    description: "VirtualMin Web & Mail Hosting Server"
+    ports:
+      SSH: 22
+      HTTP: 80
+      HTTPS: 443
+      FTP: 21
+      MySQL: 3306
+      Postfix: 25
+      IMAP: 993
+      VMin_UI: 10000
+
+  kvm_host:
+    description: "Debian KVM Hypervisor Node"
+    ports:
+      SSH: 22
+      Libvirt: 16514
+
+  webserver:
+    description: "Dedicated Web Server"
+    ports:
+      SSH: 22
+      HTTP: 80
+      HTTPS: 443
+
+  ping_only:
+    description: "ICMP Ping Only Appliance (NerdMiner, IoT, Network Bridges)"
+    ports: {}
+
+  dns_appliance:
+    description: "DNS Sinkhole (Pi-hole, AdGuard Home)"
+    ports:
+      SSH: 22
+      DNS: 53
+      HTTP: 80

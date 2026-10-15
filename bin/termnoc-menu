@@ -1,0 +1,595 @@
+#!/usr/bin/env python3
+# ==============================================================================
+# TermNOC - Operations Center Admin Menu & Hypervisor Orchestrator
+# Location: OBERWIL_CH | TUI Admin Suite | KVM Lifecycle & Multi-Installer
+# ==============================================================================
+
+import os
+import sys
+import subprocess
+import yaml
+import shutil
+import time
+
+from rich.console import Console
+from rich.table import Table
+from rich.panel import Panel
+from rich.prompt import Prompt, Confirm, IntPrompt
+from rich.text import Text
+from rich import box
+
+CONFIG_DIR = "/etc/termnoc"
+IMAGE_DIR = "/srv/termnoc/images"
+ISO_DIR = "/srv/termnoc/iso"
+PRESEED_DIR = "/srv/termnoc/preseed"
+
+console = Console()
+
+def clear_screen():
+    os.system("clear")
+
+def print_header(sub_title=""):
+    clear_screen()
+    header_text = Text.assemble(
+        (" ⚡ TERMNOC // ADMIN ORCHESTRATOR ", "bold bright_green"),
+        (" V3.0-CONTROL ", "bold black on bright_green"),
+        ("  NODE: ", "dim green"),
+        ("OBERWIL_CH", "bold white"),
+        (f" │ {sub_title}" if sub_title else "", "cyan")
+    )
+    console.print(Panel(header_text, box=box.HEAVY, border_style="dark_green"))
+    console.print()
+
+def pause():
+    console.print()
+    try:
+        Prompt.ask("[dim]Drücke [bold white]Enter[/bold white] um fortzufahren[/dim]")
+    except KeyboardInterrupt:
+        pass
+
+def load_yaml(filename: str) -> dict:
+    path = os.path.join(CONFIG_DIR, filename)
+    if os.path.exists(path):
+        try:
+            with open(path, "r") as f:
+                return yaml.safe_load(f) or {}
+        except Exception as e:
+            console.print(f"[bold red]Fehler beim Lesen von {filename}: {e}[/bold red]")
+    return {}
+
+def run_cmd(cmd: str, capture=False):
+    if capture:
+        try:
+            return subprocess.check_output(cmd, shell=True, stderr=subprocess.DEVNULL).decode().strip()
+        except:
+            return ""
+    else:
+        try:
+            return subprocess.call(cmd, shell=True)
+        except KeyboardInterrupt:
+            return 0
+
+# ==============================================================================
+# 1. KVM VIRTUAL MACHINE MANAGEMENT & IP LOOKUP
+# ==============================================================================
+
+def resolve_vm_ip(vm_name: str) -> str:
+    # 1. Versuch: libvirt guest agent
+    out = run_cmd(f"virsh domifaddr {vm_name} --source agent 2>/dev/null", capture=True)
+    if out:
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) >= 4 and parts[2].lower() == "ipv4":
+                ip = parts[3].split('/')[0]
+                if not ip.startswith("127."):
+                    return ip
+
+    # 2. Versuch: Standard domifaddr
+    out = run_cmd(f"virsh domifaddr {vm_name} 2>/dev/null", capture=True)
+    if out:
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) >= 4 and parts[2].lower() == "ipv4":
+                ip = parts[3].split('/')[0]
+                if not ip.startswith("127."):
+                    return ip
+
+    # 3. Versuch: MAC-Adresse über ARP/Neigh-Cache auf br0
+    mac_out = run_cmd(f"virsh domiflist {vm_name} 2>/dev/null", capture=True)
+    mac = ""
+    for line in mac_out.splitlines():
+        if "br0" in line or "vnet" in line:
+            parts = line.split()
+            if len(parts) >= 5:
+                mac = parts[4].lower()
+                break
+
+    if mac:
+        neigh_out = run_cmd(f"ip neigh show dev br0 2>/dev/null | grep -i '{mac}'", capture=True)
+        if neigh_out:
+            for n_line in neigh_out.splitlines():
+                parts = n_line.split()
+                if len(parts) >= 1:
+                    ip = parts[0]
+                    if not ip.startswith("127.") and not ip.startswith("fe80"):
+                        return ip
+
+    return "No IP / Booting"
+
+def get_kvm_vms():
+    out = run_cmd("virsh list --all", capture=True).splitlines()
+    vms = []
+    if len(out) > 2:
+        for line in out[2:]:
+            parts = line.split()
+            if len(parts) >= 3:
+                name = parts[1]
+                state = " ".join(parts[2:])
+                autostart_out = run_cmd(f"virsh dominfo {name} 2>/dev/null | grep -i 'Autostart:'", capture=True)
+                is_autostart = "enable" in autostart_out.lower()
+                ip_addr = resolve_vm_ip(name) if state == "running" else "--"
+                vms.append({
+                    "id": parts[0],
+                    "name": name,
+                    "state": state,
+                    "autostart": is_autostart,
+                    "ip": ip_addr
+                })
+    return vms
+
+def list_kvm_vms_table():
+    vms = get_kvm_vms()
+    table = Table(box=box.DOUBLE_EDGE, expand=True, border_style="cyan")
+    table.add_column("NR", style="dim", width=4)
+    table.add_column("VM NAME", style="bold white", width=20)
+    table.add_column("STATUS", width=14)
+    table.add_column("IP ADRESSE", style="cyan", width=17)
+    table.add_column("AUTOSTART", width=12)
+    table.add_column("DISK IMAGE", style="dim")
+
+    if not vms:
+        table.add_row("-", "[dim]Keine KVM Instanzen vorhanden[/dim]", "-", "-", "-", "-")
+    else:
+        for idx, vm in enumerate(vms, 1):
+            st = "[bright_green]RUNNING[/bright_green]" if vm["state"] == "running" else f"[dim red]{vm['state'].upper()}[/dim red]"
+            auto = "[bright_green]ENABLED[/bright_green]" if vm["autostart"] else "[dim]DISABLED[/dim]"
+            ip_str = f"[bold cyan]{vm['ip']}[/bold cyan]" if vm['ip'] not in ["--", "No IP / Booting"] else f"[dim]{vm['ip']}[/dim]"
+            img_path = f"{IMAGE_DIR}/{vm['name']}.qcow2"
+            table.add_row(str(idx), vm["name"], st, ip_str, auto, img_path)
+
+    console.print(table)
+    return vms
+
+def menu_kvm_power():
+    print_header("KVM POWER MANAGEMENT")
+    vms = list_kvm_vms_table()
+    if not vms:
+        pause()
+        return
+
+    console.print()
+    console.print("[bold cyan][1][/bold cyan] Starten (Start)")
+    console.print("[bold cyan][2][/bold cyan] Herunterfahren (Graceful Shutdown)")
+    console.print("[bold cyan][3][/bold cyan] Hart ausschalten (Destroy / Force Off)")
+    console.print("[bold cyan][4][/bold cyan] Neustart (Reboot)")
+    console.print("[bold cyan][0][/bold cyan] Zurück")
+    console.print()
+
+    action = Prompt.ask("Aktion wählen", choices=["1", "2", "3", "4", "0"], default="0")
+    if action == "0":
+        return
+
+    vm_idx = IntPrompt.ask(f"VM Nummer wählen (1-{len(vms)})")
+    if 1 <= vm_idx <= len(vms):
+        vm_name = vms[vm_idx - 1]["name"]
+        if action == "1":
+            run_cmd(f"virsh start {vm_name}")
+            console.print(f"[bright_green]VM '{vm_name}' wird gestartet...[/bright_green]")
+        elif action == "2":
+            run_cmd(f"virsh shutdown {vm_name}")
+            console.print(f"[yellow]Shutdown-Signal an '{vm_name}' gesendet.[/yellow]")
+        elif action == "3":
+            if Confirm.ask(f"[bold red]Bist du sicher, dass du '{vm_name}' hart stoppen willst?[/bold red]"):
+                run_cmd(f"virsh destroy {vm_name}")
+                console.print(f"[red]VM '{vm_name}' gestoppt.[/red]")
+        elif action == "4":
+            run_cmd(f"virsh reboot {vm_name}")
+            console.print(f"[cyan]Reboot an '{vm_name}' übermittelt.[/cyan]")
+    pause()
+
+def menu_kvm_autostart():
+    print_header("KVM AUTOSTART VERWALTUNG")
+    vms = list_kvm_vms_table()
+    if not vms:
+        pause()
+        return
+
+    console.print()
+    console.print("[dim]Wenn Autostart aktiv ist, startet die VM beim Booten des DebianServers automatisch mit.[/dim]")
+    console.print()
+
+    vm_idx = IntPrompt.ask(f"VM Nummer wählen (1-{len(vms)}, 0=Zurück)", default=0)
+    if vm_idx == 0 or vm_idx > len(vms):
+        return
+
+    target_vm = vms[vm_idx - 1]
+    vm_name = target_vm["name"]
+    current_status = target_vm["autostart"]
+
+    if current_status:
+        if Confirm.ask(f"Autostart für '{vm_name}' [red]DEAKTIVIEREN[/red]?"):
+            run_cmd(f"virsh autostart --disable {vm_name}")
+            console.print(f"[yellow]Autostart für '{vm_name}' deaktiviert.[/yellow]")
+    else:
+        if Confirm.ask(f"Autostart für '{vm_name}' [bright_green]AKTIVIEREN[/bright_green]?"):
+            run_cmd(f"virsh autostart {vm_name}")
+            console.print(f"[bright_green]Autostart für '{vm_name}' aktiviert! (Startet automatisch bei Host-Boot)[/bright_green]")
+
+    pause()
+
+def configure_debian_mirror(disk_path: str):
+    """Schreibt mirror.lan in /etc/hosts und konfiguriert den APT-Proxy"""
+    console.print("[dim]Konfiguriere Debian Mirror & APT Proxy im QCOW2-Image...[/dim]")
+    commands = (
+        f"guestfish -a {disk_path} -i << 'EOF'\n"
+        "sh 'if ! grep -q \"mirror.lan\" /etc/hosts 2>/dev/null; then echo \"192.168.86.75 mirror.lan\" >> /etc/hosts; fi'\n"
+        "sh 'mkdir -p /etc/apt/apt.conf.d && echo \"Acquire::http::Proxy \\\"http://mirror.lan:3142\\\";\" > /etc/apt/apt.conf.d/01proxy'\n"
+        "EOF"
+    )
+    res = run_cmd(commands)
+    if res == 0:
+        console.print("[bright_green]✓ /etc/hosts (192.168.86.75 mirror.lan) konfiguriert.[/bright_green]")
+        console.print("[bright_green]✓ /etc/apt/apt.conf.d/01proxy (Proxy mirror.lan:3142) hinterlegt.[/bright_green]")
+    else:
+        console.print("[yellow][!] Hinweis: Dateisystem konnte nicht direkt modifiziert werden (noch nicht formatiert).[/yellow]")
+
+def menu_kvm_create():
+    print_header("NEUE KVM VM DEPLOYEN")
+    os.makedirs(IMAGE_DIR, exist_ok=True)
+    os.makedirs(ISO_DIR, exist_ok=True)
+    os.makedirs(PRESEED_DIR, exist_ok=True)
+
+    vm_name = Prompt.ask("[bold white]VM Name[/bold white] (z.B. deb13-srv01)")
+    if not vm_name:
+        return
+
+    vcpus = IntPrompt.ask("Anzahl vCPUs", default=2)
+    ram_mb = IntPrompt.ask("RAM in MB (z.B. 2048, 4096)", default=2048)
+    disk_gb = IntPrompt.ask("Festplattengröße in GB", default=20)
+    enable_auto = Confirm.ask("Soll diese VM automatisch beim Host-Boot starten (Autostart)?", default=True)
+    
+    console.print()
+    console.print("[bold cyan]Wähle Installationsmethode / Profil:[/bold cyan]")
+    console.print("[bold bright_green][1] Standard lokal Deb13 Server (100% Unattended Preseed)[/bold bright_green]")
+    console.print("    [dim]Autonom │ EN (US) │ Schweiz (DE-CH) │ User: admin │ Proxy: mirror.lan:3142[/dim]")
+    console.print("[bold cyan][2] Interaktiv Netboot (Lokaler Mirror: 192.168.86.75:3142)[/bold cyan]")
+    console.print("    [dim]Menügeführt über serielle Konsole │ Nutzt lokalen Mirror-Cache │ Setzt Proxy-Dateien[/dim]")
+    console.print("[bold yellow][3] Interaktiv Netboot (Offizieller Debian Mirror / Direkt)[/bold yellow]")
+    console.print("    [dim]Menügeführt über serielle Konsole │ Lädt direkt aus dem Internet │ Kein lokaler Proxy[/dim]")
+    console.print("[4] ISO-Datei aus /srv/termnoc/iso/ (VNC Installation)")
+    console.print("[5] Leere QCOW2 Disk vorbereiten (Nur Hardware registrieren)")
+    prof = Prompt.ask("Auswahl", choices=["1", "2", "3", "4", "5"], default="1")
+
+    disk_path = f"{IMAGE_DIR}/{vm_name}.qcow2"
+
+    console.print()
+    console.print(f"[bold cyan]Deploye VM:[/bold cyan] {vm_name} ({vcpus} vCPU, {ram_mb} MB RAM, {disk_gb} GB Disk auf /srv)")
+    if not Confirm.ask("Installation jetzt starten?"):
+        return
+
+    console.print(f"[dim]Erstelle Sparse-Disk: {disk_path}...[/dim]")
+    run_cmd(f"qemu-img create -f qcow2 {disk_path} {disk_gb}G")
+
+    if prof == "1":
+        # 100% automatisierter Preseed
+        preseed_file = f"{PRESEED_DIR}/deb13-standard.cfg"
+        if not os.path.exists(preseed_file):
+            console.print(f"[bold red]Preseed-Datei fehlt unter {preseed_file}![/bold red]")
+            pause()
+            return
+
+        temp_preseed = f"/tmp/preseed_{vm_name}.cfg"
+        with open(preseed_file, "r") as pf:
+            content = pf.read().replace("deb13-node", vm_name)
+        with open(temp_preseed, "w") as tf:
+            tf.write(content)
+
+        console.print("[bold bright_green]Starte vollautomatische Preseed-Installation im Hintergrund...[/bold bright_green]")
+        console.print("[dim]Keine Eingaben nötig. Das System bootet nach Fertigstellung selbstständig.[/dim]\n")
+
+        cmd = (
+            f"virt-install --name {vm_name} --vcpus {vcpus} --memory {ram_mb} "
+            f"--disk path={disk_path},format=qcow2,bus=virtio "
+            f"--location 'http://deb.debian.org/debian/dists/trixie/main/installer-amd64/' "
+            f"--initrd-inject={temp_preseed} "
+            f"--extra-args='auto=true priority=critical file=/preseed_{vm_name}.cfg console=ttyS0,115200n8 serial mirror/http/proxy=http://192.168.86.75:3142' "
+            f"--network bridge=br0,model=virtio "
+            f"--graphics none --noautoconsole"
+        )
+        run_cmd(cmd)
+        
+        if os.path.exists(temp_preseed):
+            os.remove(temp_preseed)
+        
+        console.print(f"[bright_green]✓ Installation läuft autonom![/bright_green]")
+        console.print(f"[dim]Tipp: Mit 'virsh console {vm_name}' kannst du dem Installer zuschauen (Rückkehr mit Ctrl + ]).[/dim]")
+
+    elif prof == "2":
+        # Interaktiver Menü-Installer über serielle Konsole mit lokalem Mirror
+        console.print("[bold cyan]Starte interaktiven Debian Netboot-Installer (Lokaler Mirror)...[/bold cyan]")
+        console.print("[dim]Hinweis: Zum Verlassen der Konsole jederzeit 'Ctrl + ]' drücken.[/dim]\n")
+        time.sleep(1)
+
+        cmd = (
+            f"virt-install --name {vm_name} --vcpus {vcpus} --memory {ram_mb} "
+            f"--disk path={disk_path},format=qcow2,bus=virtio "
+            f"--location 'http://deb.debian.org/debian/dists/trixie/main/installer-amd64/' "
+            f"--extra-args='console=ttyS0,115200n8 serial mirror/http/proxy=http://192.168.86.75:3142' "
+            f"--network bridge=br0,model=virtio "
+            f"--graphics none"
+        )
+        run_cmd(cmd)
+        configure_debian_mirror(disk_path)
+
+    elif prof == "3":
+        # Interaktiver Menü-Installer über serielle Konsole mit offiziellem Debian Mirror (ohne Proxy)
+        console.print("[bold yellow]Starte interaktiven Debian Netboot-Installer (Offizieller Upstream Mirror)...[/bold yellow]")
+        console.print("[dim]Hinweis: Zum Verlassen der Konsole jederzeit 'Ctrl + ]' drücken.[/dim]\n")
+        time.sleep(1)
+
+        cmd = (
+            f"virt-install --name {vm_name} --vcpus {vcpus} --memory {ram_mb} "
+            f"--disk path={disk_path},format=qcow2,bus=virtio "
+            f"--location 'http://deb.debian.org/debian/dists/trixie/main/installer-amd64/' "
+            f"--extra-args='console=ttyS0,115200n8 serial' "
+            f"--network bridge=br0,model=virtio "
+            f"--graphics none"
+        )
+        run_cmd(cmd)
+
+    elif prof == "4":
+        # ISO Installation
+        isos = [f for f in os.listdir(ISO_DIR) if f.endswith(".iso")]
+        if not isos:
+            console.print(f"[bold red]Keine ISOs in {ISO_DIR} gefunden![/bold red]")
+            pause()
+            return
+        console.print("[cyan]Verfügbare ISOs:[/cyan]")
+        for i, f in enumerate(isos, 1):
+            console.print(f"[{i}] {f}")
+        iso_pick = IntPrompt.ask("ISO wählen", default=1)
+        selected_iso = f"{ISO_DIR}/{isos[iso_pick - 1]}"
+
+        cmd = (
+            f"virt-install --name {vm_name} --vcpus {vcpus} --memory {ram_mb} "
+            f"--disk path={disk_path},format=qcow2,bus=virtio "
+            f"--cdrom {selected_iso} "
+            f"--network bridge=br0,model=virtio "
+            f"--graphics vnc,listen=0.0.0.0 --noautoconsole"
+        )
+        run_cmd(cmd)
+        console.print(f"[bright_green]VM '{vm_name}' mit ISO {isos[iso_pick-1]} gestartet![/bright_green]")
+
+    elif prof == "5":
+        # Leere QCOW2 Disk
+        cmd = (
+            f"virt-install --name {vm_name} --vcpus {vcpus} --memory {ram_mb} "
+            f"--disk path={disk_path},format=qcow2,bus=virtio "
+            f"--network bridge=br0,model=virtio "
+            f"--graphics none --console pty,target_type=serial "
+            f"--os-variant debian12 --import --noautoconsole"
+        )
+        run_cmd(cmd)
+        console.print(f"[bright_green]VM '{vm_name}' erfolgreich in libvirt registriert![/bright_green]")
+
+    if enable_auto:
+        run_cmd(f"virsh autostart {vm_name}")
+        console.print(f"[bright_green]Autostart für '{vm_name}' wurde dauerhaft hinterlegt.[/bright_green]")
+
+    pause()
+
+def menu_kvm_delete():
+    print_header("KVM VM LÖSCHEN")
+    vms = list_kvm_vms_table()
+    if not vms:
+        pause()
+        return
+
+    vm_idx = IntPrompt.ask(f"VM Nummer zum LÖSCHEN wählen (1-{len(vms)}, 0=Abbruch)", default=0)
+    if vm_idx == 0 or vm_idx > len(vms):
+        return
+
+    vm_name = vms[vm_idx - 1]["name"]
+    disk_path = f"{IMAGE_DIR}/{vm_name}.qcow2"
+
+    console.print(f"\n[bold red]ACHTUNG: Dies stoppt '{vm_name}', löscht die VM aus libvirt und entfernt die Festplatte dauerhaft![/bold red]")
+    console.print(f"[dim]Zu entfernende Datei: {disk_path}[/dim]\n")
+
+    if Confirm.ask(f"Bist du absolut sicher, dass du '{vm_name}' löschen willst?", default=False):
+        run_cmd(f"virsh destroy {vm_name} 2>/dev/null")
+        run_cmd(f"virsh undefine {vm_name} --nvram 2>/dev/null || virsh undefine {vm_name}")
+        if os.path.exists(disk_path):
+            try:
+                os.remove(disk_path)
+                console.print(f"[yellow]Speicherabbild {disk_path} gelöscht.[/yellow]")
+            except Exception as e:
+                console.print(f"[red]Fehler beim Löschen des Images: {e}[/red]")
+        console.print(f"[bright_green]VM '{vm_name}' wurde vollständig entfernt.[/bright_green]")
+    else:
+        console.print("[dim]Löschvorgang abgebrochen.[/dim]")
+    pause()
+
+def menu_kvm_console():
+    print_header("SERIAL CONSOLE ZUGRIFF")
+    vms = list_kvm_vms_table()
+    if not vms:
+        pause()
+        return
+
+    vm_idx = IntPrompt.ask(f"VM wählen (0=Abbruch)", default=0)
+    if vm_idx == 0 or vm_idx > len(vms):
+        return
+
+    vm_name = vms[vm_idx - 1]["name"]
+    console.print(f"[dim]Verbinde zu serial console von {vm_name}... (Beenden mit: Ctrl + ])[/dim]")
+    time.sleep(1)
+    run_cmd(f"virsh console {vm_name}")
+
+# ==============================================================================
+# 2. FLEET UPDATES & SYSTEM WARTUNG
+# ==============================================================================
+
+def update_local_host():
+    print_header("LOKALE HOST WARTUNG (DebianServer)")
+    console.print("[cyan]Starte Paketaktualisierung (apt update && apt upgrade)...[/cyan]\n")
+    run_cmd("apt update && apt upgrade -y && apt autoremove -y")
+    console.print("\n[bright_green]Lokaler Server ist auf dem neuesten Stand![/bright_green]")
+    pause()
+
+def update_remote_nodes():
+    print_header("REMOTE FLOTTEN-UPDATE (SSH)")
+    nodes = []
+    for f in ["lan.yaml", "remote.yaml", "customer.yaml"]:
+        cfg = load_yaml(f)
+        for s in cfg.get("servers", []):
+            if s.get("auth") == "password" or s.get("auth") == "key":
+                nodes.append(s)
+
+    if not nodes:
+        console.print("[dim]Keine Remote-Nodes mit SSH-Zugang in YAML konfiguriert.[/dim]")
+        pause()
+        return
+
+    table = Table(box=box.SIMPLE, expand=True)
+    table.add_column("NR", width=4)
+    table.add_column("NAME", width=18, style="bold white")
+    table.add_column("HOST / IP", width=22)
+    table.add_column("USER", width=12)
+
+    for i, n in enumerate(nodes, 1):
+        table.add_row(str(i), n["name"], n["host"], n.get("user", "root"))
+    console.print(table)
+    console.print()
+
+    pick = Prompt.ask("Node Nummer wählen ([bold cyan]A[/bold cyan] = Alle durchführen, [bold cyan]0[/bold cyan] = Zurück)", default="0")
+    if pick == "0":
+        return
+
+    targets = nodes if pick.upper() == "A" else ([nodes[int(pick) - 1]] if pick.isdigit() and 1 <= int(pick) <= len(nodes) else [])
+    
+    for t in targets:
+        console.print(f"\n[bold cyan]═══ Aktualisiere Node: {t['name']} ({t['host']}) ═══[/bold cyan]")
+        user = t.get("user", "root")
+        host = t["host"]
+        if t.get("auth") == "password":
+            passwd = t.get("pass", "")
+            cmd = f"sshpass -p '{passwd}' ssh -t -o StrictHostKeyChecking=no {user}@{host} 'sudo apt update && sudo apt upgrade -y && sudo apt autoremove -y'"
+        else:
+            key = t.get("key_path", "~/.ssh/id_ed25519")
+            cmd = f"ssh -t -i {key} -o StrictHostKeyChecking=no {user}@{host} 'sudo apt update && sudo apt upgrade -y && sudo apt autoremove -y'"
+        run_cmd(cmd)
+
+    console.print("\n[bright_green]Wartungsdurchlauf beendet.[/bright_green]")
+    pause()
+
+# ==============================================================================
+# 3. YAML CONFIGURATION EDITOR
+# ==============================================================================
+
+def edit_yaml_configs():
+    while True:
+        print_header("KONFIGURATIONEN EDITIEREN (/etc/termnoc/)")
+        console.print("[bold cyan][1][/bold cyan] types.yaml    (Server-Arten & Port-Definitionen)")
+        console.print("[bold cyan][2][/bold cyan] local.yaml    (Lokaler Host & Hypervisor)")
+        console.print("[bold cyan][3][/bold cyan] lan.yaml      (Lokales LAN z.B. Pi01, Miner)")
+        console.print("[bold cyan][4][/bold cyan] remote.yaml   (Eigene Remote-Server z.B. de01ch001)")
+        console.print("[bold cyan][5][/bold cyan] customer.yaml (Verwaltete Kundenserver)")
+        console.print("[bold cyan][0][/bold cyan] Zurück zum Hauptmenü")
+        console.print()
+
+        choice = Prompt.ask("Datei wählen", choices=["1", "2", "3", "4", "5", "0"], default="0")
+        mapping = {
+            "1": "types.yaml",
+            "2": "local.yaml",
+            "3": "lan.yaml",
+            "4": "remote.yaml",
+            "5": "customer.yaml"
+        }
+        if choice == "0":
+            break
+        target_file = f"{CONFIG_DIR}/{mapping[choice]}"
+        editor = os.environ.get("EDITOR", "nano")
+        run_cmd(f"{editor} {target_file}")
+
+# ==============================================================================
+# MAIN ROUTINE
+# ==============================================================================
+
+def main_menu():
+    while True:
+        try:
+            print_header("HAUPTMENÜ // ORCHESTRATION")
+            
+            vms = get_kvm_vms()
+            running_vms = sum(1 for v in vms if v["state"] == "running")
+            autostart_vms = sum(1 for v in vms if v["autostart"])
+            
+            info_panel = Panel(
+                f"[bold white]Hypervisor:[/bold white] Debian KVM Host  │  [bold white]VMs aktiv:[/bold white] [bright_green]{running_vms}[/bright_green]/{len(vms)}  │  [bold white]Autostart aktiv:[/bold white] [cyan]{autostart_vms}[/cyan]  │  [bold white]Storage Pool:[/bold white] /srv/termnoc",
+                box=box.ROUNDED,
+                border_style="dark_green"
+            )
+            console.print(info_panel)
+            console.print()
+
+            console.print("[bold bright_green]─── KVM HYPERVISOR ───[/bold bright_green]")
+            console.print(" [bold cyan][1][/bold cyan] VM Status & Power-Management (Start/Stop/Reboot)")
+            console.print(" [bold cyan][2][/bold cyan] Autostart verwalten (Start bei Host-Boot)")
+            console.print(" [bold cyan][3][/bold cyan] Neue KVM VM deployen (Debian Preseed/Manuell, ISO, QCOW2)")
+            console.print(" [bold cyan][4][/bold cyan] KVM VM löschen & Speicherbereinigung")
+            console.print(" [bold cyan][5][/bold cyan] Serial Console öffnen (virsh console)")
+            console.print()
+            console.print("[bold bright_green]─── WARTUNG & FLOTTE ───[/bold bright_green]")
+            console.print(" [bold cyan][6][/bold cyan] Lokalen DebianServer updaten (apt upgrade)")
+            console.print(" [bold cyan][7][/bold cyan] Remote Nodes updaten (Automatisierter SSH-Durchlauf)")
+            console.print()
+            console.print("[bold bright_green]─── MONITORING & CONFIG ───[/bold bright_green]")
+            console.print(" [bold cyan][8][/bold cyan] YAML Server- & Port-Definitionen bearbeiten")
+            console.print(" [bold cyan][9][/bold cyan] TermNOC Live-Display starten (tty1 Ansicht)")
+            console.print()
+            console.print(" [bold red][0][/bold red] Beenden / Zur Shell")
+            console.print()
+
+            choice = Prompt.ask("[bold white]Aktion wählen[/bold white]", choices=["1", "2", "3", "4", "5", "6", "7", "8", "9", "0"], default="0")
+
+            if choice == "1":
+                menu_kvm_power()
+            elif choice == "2":
+                menu_kvm_autostart()
+            elif choice == "3":
+                menu_kvm_create()
+            elif choice == "4":
+                menu_kvm_delete()
+            elif choice == "5":
+                menu_kvm_console()
+            elif choice == "6":
+                update_local_host()
+            elif choice == "7":
+                update_remote_nodes()
+            elif choice == "8":
+                edit_yaml_configs()
+            elif choice == "9":
+                run_cmd("termnoc-display")
+            elif choice == "0":
+                clear_screen()
+                console.print("[bright_green]TermNOC Admin Suite beendet.[/bright_green]\n")
+                sys.exit(0)
+        except KeyboardInterrupt:
+            clear_screen()
+            continue
+
+if __name__ == "__main__":
+    if os.geteuid() != 0:
+        console.print("[bold red][!] Bitte starte termnoc-menu mit sudo bzw. als Root-Benutzer.[/bold red]")
+        sys.exit(1)
+    main_menu()

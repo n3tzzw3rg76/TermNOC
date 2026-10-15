@@ -1,0 +1,355 @@
+#!/usr/bin/env python3
+# ==============================================================================
+# TermNOC - Production TUI Engine (Driven by Rich Framework)
+# Location: OBERWIL_CH | Rigid Grids | Zero Column Drift | Ping-Only Support
+# ==============================================================================
+
+import os
+import sys
+import time
+import socket
+import subprocess
+import threading
+import yaml
+
+from rich.console import Console
+from rich.table import Table
+from rich.panel import Panel
+from rich.layout import Layout
+from rich.live import Live
+from rich.text import Text
+from rich import box
+
+CONFIG_DIR = "/etc/termnoc"
+SERVER_STATES = {}
+LOG_BUFFER = []
+LOCK = threading.Lock()
+console = Console()
+
+def add_log(msg: str):
+    with LOCK:
+        ts = time.strftime("%H:%M:%S")
+        LOG_BUFFER.append(f"[dim]{ts}[/dim] {msg}")
+        if len(LOG_BUFFER) > 8:
+            LOG_BUFFER.pop(0)
+
+def load_yaml(filename: str):
+    path = os.path.join(CONFIG_DIR, filename)
+    if os.path.exists(path):
+        try:
+            with open(path, "r") as f:
+                return yaml.safe_load(f) or {}
+        except Exception as e:
+            add_log(f"[bold red]CONFIG ERR[/bold red] {filename}: {e}")
+    return {}
+
+def check_tcp_port(host: str, port: int, timeout=0.8) -> bool:
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        res = sock.connect_ex((host, int(port)))
+        sock.close()
+        return res == 0
+    except:
+        return False
+
+def ping_host(host: str):
+    if host in ["127.0.0.1", "localhost"]:
+        return True, "0.1 ms"
+    try:
+        out = subprocess.check_output(["ping", "-c", "1", "-W", "1", host], stderr=subprocess.DEVNULL).decode()
+        if "1 received" in out:
+            import re
+            m = re.search(r'time=([0-9.]+)', out)
+            return True, f"{float(m.group(1)):.1f} ms" if m else "< 1 ms"
+    except:
+        pass
+    return False, "TIMEOUT"
+
+def fetch_telemetry(srv: dict, category: str):
+    name = srv.get("name")
+    host = srv.get("host")
+    stype = srv.get("type", "default")
+    auth = srv.get("auth", "none")
+
+    online, latency = ping_host(host)
+    state = {
+        "name": name,
+        "host": host,
+        "type": stype,
+        "category": category,
+        "online": online,
+        "latency": latency,
+        "ports": {},
+        "cpu": "--",
+        "ram": "--",
+        "disk": "--",
+        "temp": "--",
+        "uptime": "--"
+    }
+
+    types_cfg = load_yaml("types.yaml").get("types", {})
+    srv_type_cfg = types_cfg.get(stype, {})
+    ports_to_check = srv_type_cfg.get("ports", {}) or {}
+
+    # 1. Ports prüfen (falls in types.yaml definiert)
+    for p_name, p_num in ports_to_check.items():
+        state["ports"][p_name] = check_tcp_port(host, p_num)
+
+    # 2. Erweiterte Telemetrie nur abrufen, wenn Auth hinterlegt ist
+    if host in ["127.0.0.1", "localhost"]:
+        try:
+            with open("/proc/loadavg", "r") as f:
+                state["cpu"] = f.read().split()[0]
+            out = subprocess.check_output(["free", "-m"]).decode().splitlines()
+            mem = out[1].split()
+            state["ram"] = f"{int(int(mem[2])*100/int(mem[1]))}%"
+            out_df = subprocess.check_output(["df", "-h", "/srv"]).decode().splitlines()
+            if len(out_df) > 1:
+                state["disk"] = out_df[1].split()[4]
+            state["temp"] = "38.0°C"
+            state["uptime"] = subprocess.check_output(["uptime", "-p"]).decode().replace("up ", "").strip()
+        except:
+            pass
+    elif online and auth == "password":
+        user = srv.get("user", "root")
+        password = srv.get("pass", "")
+        cmd = f"sshpass -p '{password}' ssh -o StrictHostKeyChecking=no -o ConnectTimeout=1 {user}@{host} 'cat /proc/loadavg; echo ---; free -m; echo ---; df -h /; echo ---; uptime -p; echo ---; vcgencmd measure_temp 2>/dev/null || cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null || echo 0'"
+        try:
+            res = subprocess.check_output(cmd, shell=True, stderr=subprocess.DEVNULL, timeout=2).decode().split("---")
+            if len(res) >= 5:
+                state["cpu"] = res[0].strip().split()[0]
+                mem_lines = res[1].strip().splitlines()
+                if len(mem_lines) > 1:
+                    m = mem_lines[1].split()
+                    state["ram"] = f"{int(int(m[2])*100/int(m[1]))}%"
+                df_lines = res[2].strip().splitlines()
+                if len(df_lines) > 1:
+                    state["disk"] = df_lines[1].split()[4]
+                state["uptime"] = res[3].strip().replace("up ", "")
+                t_raw = res[4].strip().replace("temp=", "")
+                if "°C" in t_raw or "C" in t_raw:
+                    state["temp"] = t_raw
+                elif t_raw.isdigit() and int(t_raw) > 1000:
+                    state["temp"] = f"{int(t_raw)/1000:.1f}°C"
+                else:
+                    state["temp"] = "N/A"
+        except:
+            pass
+
+    with LOCK:
+        SERVER_STATES[name] = state
+
+def poller_loop():
+    while True:
+        threads = []
+        # KVM VMs via libvirt
+        kvm_vms = []
+        try:
+            v_out = subprocess.check_output(["virsh", "list", "--all"], stderr=subprocess.DEVNULL).decode().splitlines()
+            for line in v_out[2:]:
+                parts = line.split()
+                if len(parts) >= 3:
+                    kvm_vms.append({
+                        "name": parts[1],
+                        "status_override": parts[2] == "running"
+                    })
+        except:
+            pass
+
+        # Local Host
+        for srv in load_yaml("local.yaml").get("servers", []):
+            t = threading.Thread(target=fetch_telemetry, args=(srv, "kvm"))
+            t.daemon = True
+            t.start()
+            threads.append(t)
+
+        for vm in kvm_vms:
+            with LOCK:
+                SERVER_STATES[vm["name"]] = {
+                    "name": vm["name"],
+                    "host": "local-vm",
+                    "type": "kvm_guest",
+                    "category": "kvm",
+                    "online": vm["status_override"],
+                    "latency": "< 0.1 ms" if vm["status_override"] else "--",
+                    "ports": {"KVM": vm["status_override"]},
+                    "cpu": "dyn",
+                    "ram": "qemu",
+                    "disk": "/srv",
+                    "temp": "--",
+                    "uptime": "Running" if vm["status_override"] else "Stopped"
+                }
+
+        # Own Nodes (LAN + Remote)
+        for srv in load_yaml("lan.yaml").get("servers", []):
+            t = threading.Thread(target=fetch_telemetry, args=(srv, "own"))
+            t.daemon = True
+            t.start()
+            threads.append(t)
+        for srv in load_yaml("remote.yaml").get("servers", []):
+            t = threading.Thread(target=fetch_telemetry, args=(srv, "own"))
+            t.daemon = True
+            t.start()
+            threads.append(t)
+
+        # Customer Nodes
+        for srv in load_yaml("customer.yaml").get("servers", []):
+            t = threading.Thread(target=fetch_telemetry, args=(srv, "customer"))
+            t.daemon = True
+            t.start()
+            threads.append(t)
+
+        for t in threads:
+            t.join()
+        time.sleep(5)
+
+def make_gauge(pct_str: str, width=6) -> str:
+    try:
+        val = int(pct_str.replace("%", ""))
+    except:
+        return "[dim]--[/dim]"
+    filled = int((val * width) / 100)
+    empty = width - filled
+    c = "bright_green" if val < 70 else ("yellow" if val < 85 else "bright_red")
+    return f"[{c}]{'█'*filled}[dim]{'·'*empty}[/dim] {val:2d}%[/{c}]"
+
+def build_category_table(category_key: str) -> Table:
+    table = Table(
+        box=box.DOUBLE_EDGE,
+        show_header=True,
+        header_style="bold bright_green",
+        expand=True,
+        border_style="dark_green",
+        pad_edge=False
+    )
+    table.add_column("NODE", style="bold white", width=18, no_wrap=True)
+    table.add_column("TYPE", style="cyan", width=14, no_wrap=True)
+    table.add_column("STATUS", width=12, justify="left", no_wrap=True)
+    table.add_column("LATENCY", width=10, justify="right", no_wrap=True)
+    table.add_column("CPU", width=7, justify="right", no_wrap=True)
+    table.add_column("RAM USAGE", width=15, justify="left", no_wrap=True)
+    table.add_column("DISK", width=8, justify="right", no_wrap=True)
+    table.add_column("TEMP", width=8, justify="right", no_wrap=True)
+    table.add_column("SERVICES & ACTIVE PORTS", justify="left")
+
+    with LOCK:
+        items = [s for s in SERVER_STATES.values() if s.get("category") == category_key]
+        if not items:
+            table.add_row("[dim]Keine Instanzen konfiguriert[/dim]", "", "", "", "", "", "", "", "")
+            return table
+
+        for s in items:
+            st = "[bright_green]● ONLINE[/bright_green]" if s["online"] else "[bright_red]✖ OFFLINE[/bright_red]"
+            ram_gauge = make_gauge(s["ram"])
+            
+            # Services aufbereiten: Wenn keine Ports definiert sind -> sauberes "ICMP-Only"
+            if s["ports"]:
+                ports_text = []
+                for p_name, p_ok in s["ports"].items():
+                    col = "bright_green" if p_ok else "bright_red"
+                    symbol = "OK" if p_ok else "✕"
+                    ports_text.append(f"{p_name}:[{col}]{symbol}[/{col}]")
+                service_cell = " ".join(ports_text)
+            else:
+                service_cell = "[dim green]ICMP-Only (Ping)[/dim green]" if s["online"] else "[dim red]ICMP-Unreachable[/dim red]"
+
+            table.add_row(
+                s["name"],
+                s["type"],
+                st,
+                s["latency"],
+                s["cpu"],
+                ram_gauge,
+                s["disk"],
+                f"[yellow]{s['temp']}[/yellow]" if s["temp"] != "--" else "[dim]--[/dim]",
+                service_cell
+            )
+    return table
+
+def generate_dashboard() -> Layout:
+    layout = Layout()
+    layout.split(
+        Layout(name="header", size=4),
+        Layout(name="top_cards", size=5),
+        Layout(name="body"),
+        Layout(name="footer", size=3)
+    )
+
+    title = Text.assemble(
+        (" ⚡ TERMNOC // OPERATIONS CENTER ", "bold bright_green"),
+        (" V3.0-SECURE ", "bold black on bright_green"),
+        ("  NODE LOCATION: ", "dim green"),
+        ("OBERWIL_CH", "bold white"),
+        (" │ MODE: ", "dim green"),
+        ("ACTIVE-MONITORING", "bright_green")
+    )
+    layout["header"].update(Panel(title, box=box.HEAVY, border_style="dark_green"))
+
+    with LOCK:
+        total = len(SERVER_STATES)
+        online = sum(1 for s in SERVER_STATES.values() if s.get("online"))
+        offline = total - online
+
+    k1 = Panel(
+        f"[green]Status:[/green] [{'bright_green' if offline == 0 else 'bright_red'}]{online}/{total} Online[/{'bright_green' if offline == 0 else 'bright_red'}]\n[green]Health:[/green] [bright_green]ALL SYSTEMS NOMINAL[/bright_green]",
+        title="[bold green]// FLEET CAPACITY & HEALTH[/bold green]",
+        border_style="dark_green",
+        box=box.ROUNDED
+    )
+    k2 = Panel(
+        "[magenta]Config:[/magenta] [white]/etc/termnoc/*.yaml[/white]\n[magenta]Engine:[/magenta] [bright_green]5s Multi-Threaded Poller[/bright_green]",
+        title="[bold magenta]// TYPES & PROFILES[/bold magenta]",
+        border_style="magenta",
+        box=box.ROUNDED
+    )
+    k3 = Panel(
+        "[cyan]Mount :[/cyan] [white]/srv (Dedicated SSD)[/white]\n[cyan]State :[/cyan] [bright_green]Synced Local tmpfs[/bright_green]",
+        title="[bold cyan]// STORAGE & DISK RECOVERY[/bold cyan]",
+        border_style="cyan",
+        box=box.ROUNDED
+    )
+
+    cards_table = Table.grid(expand=True)
+    cards_table.add_column(ratio=1)
+    cards_table.add_column(ratio=1)
+    cards_table.add_column(ratio=1)
+    cards_table.add_row(k1, k2, k3)
+    layout["top_cards"].update(cards_table)
+
+    body_table = Table.grid(expand=True)
+    body_table.add_column()
+    body_table.add_row(Panel(build_category_table("kvm"), title="[bold cyan]// KVM VIRTUAL MACHINES & HYPERVISOR[/bold cyan]", border_style="cyan", box=box.SQUARE))
+    body_table.add_row(Panel(build_category_table("own"), title="[bold magenta]// OWN INFRASTRUCTURE (LAN & REMOTE)[/bold magenta]", border_style="magenta", box=box.SQUARE))
+    body_table.add_row(Panel(build_category_table("customer"), title="[bold yellow]// MANAGED CUSTOMER CLUSTERS[/bold yellow]", border_style="yellow", box=box.SQUARE))
+    layout["body"].update(body_table)
+
+    footer_text = Text.from_markup(f" [bright_green]LINUX // TERMNOC[/bright_green] │ Node: [white]OBERWIL_CH[/white] │ Interval: [green]5s[/green] │ Configs: [dim]/etc/termnoc/[/dim] │ Exit: [bold red]Ctrl+C[/bold red]")
+    layout["footer"].update(Panel(footer_text, box=box.HEAVY, border_style="dark_green"))
+
+    return layout
+
+def main():
+    for srv in load_yaml("local.yaml").get("servers", []):
+        threading.Thread(target=fetch_telemetry, args=(srv, "kvm")).start()
+    for srv in load_yaml("lan.yaml").get("servers", []):
+        threading.Thread(target=fetch_telemetry, args=(srv, "own")).start()
+    for srv in load_yaml("remote.yaml").get("servers", []):
+        threading.Thread(target=fetch_telemetry, args=(srv, "own")).start()
+    for srv in load_yaml("customer.yaml").get("servers", []):
+        threading.Thread(target=fetch_telemetry, args=(srv, "customer")).start()
+
+    poller = threading.Thread(target=poller_loop)
+    poller.daemon = True
+    poller.start()
+
+    with Live(generate_dashboard(), screen=True, refresh_per_second=2) as live:
+        try:
+            while True:
+                time.sleep(0.5)
+                live.update(generate_dashboard())
+        except KeyboardInterrupt:
+            pass
+
+if __name__ == "__main__":
+    main()

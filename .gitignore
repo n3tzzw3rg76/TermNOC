@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+*$py.class
+config/*.yaml
+*.yaml
+!config.example/*.yaml.example
+!types.yaml.example
+*.qcow2
+*.raw
+*.iso
+*.img
+*.log
+/tmp/
